@@ -6,7 +6,6 @@ import json
 import os
 from datetime import datetime, timedelta
 import time
-import groq
 import logging
 from functools import wraps
 
@@ -112,6 +111,8 @@ def call_groq_api(system_prompt, user_prompt, max_retries=3):
         return None
 
     try:
+        # Import groq here to handle version issues
+        import groq
         client = groq.Groq(api_key=GROQ_API_KEY)
     except Exception as e:
         logger.error(f"Error initializing Groq client: {e}")
@@ -126,31 +127,30 @@ def call_groq_api(system_prompt, user_prompt, max_retries=3):
                 ],
                 model="llama3-8b-8192",
                 response_format={"type": "json_object"},
-                max_tokens=8192,
+                max_tokens=4096,
+                temperature=0.3
             )
             
             response_text = chat_completion.choices[0].message.content
             return json.loads(response_text)
 
-        except groq.RateLimitError as e:
-            wait_time = 20 * (attempt + 1)
-            logger.warning(f"Rate limit hit. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
-            time.sleep(wait_time)
-        except groq.APIError as e:
-            wait_time = 10 * (attempt + 1)
-            logger.error(f"Groq API Error: {e}. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
-            time.sleep(wait_time)
-        except json.JSONDecodeError as e:
-            logger.error(f"Error decoding JSON from Groq response: {e}")
-            return None
         except Exception as e:
-            logger.error(f"An unexpected error occurred: {e}")
-            return None
+            if "rate" in str(e).lower():
+                wait_time = 30 * (attempt + 1)
+                logger.warning(f"Rate limit hit. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+            elif "api" in str(e).lower():
+                wait_time = 15 * (attempt + 1)
+                logger.error(f"Groq API Error: {e}. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Unexpected error: {e}")
+                return None
 
     logger.error("All retries failed.")
     return None
 
-def analyze_articles_in_batches(articles, batch_size=25):
+def analyze_articles_in_batches(articles, batch_size=15):
     """
     Analyzes articles in smaller batches to avoid hitting API rate limits.
     """
@@ -163,22 +163,21 @@ def analyze_articles_in_batches(articles, batch_size=25):
 
         content_for_analysis = ""
         for article in batch:
-            content_for_analysis += f"Title: {article['title']}\nSummary: {article['summary']}\n\n"
+            content_for_analysis += f"Title: {article['title']}\nSummary: {article['summary'][:200]}...\n\n"
 
-        system_prompt = "You are an expert geopolitical analyst focused on India-US relations. Your task is to identify news topics that specifically involve an interaction between India and the United States. You must respond ONLY with a valid JSON object containing a single key 'trends' which is an array of objects."
+        system_prompt = "You are an expert geopolitical analyst focused on India-US relations. Identify news topics involving BOTH India and USA. Respond ONLY with valid JSON containing 'trends' array."
         user_prompt = f"""
-        From the following batch of articles, please identify key topics or ideas that involve BOTH India and the USA. Ignore topics that are only about India or only about the USA.
-        For each topic, provide a concise name and the titles of all relevant articles in this batch.
+        From these articles, identify topics involving BOTH India and USA. Ignore single-country topics.
         
         Content:
         ---
         {content_for_analysis}
         ---
         
-        Example JSON format:
+        JSON format:
         {{
             "trends": [
-                {{ "trend_name": "US-India Trade Negotiations", "relevant_articles": ["Title A", "Title B"] }}
+                {{ "trend_name": "US-India Trade Deal", "relevant_articles": ["Article Title 1", "Article Title 2"] }}
             ]
         }}
         """
@@ -187,8 +186,9 @@ def analyze_articles_in_batches(articles, batch_size=25):
         if response_json and 'trends' in response_json and isinstance(response_json['trends'], list):
             all_trends.extend(response_json['trends'])
         
+        # Wait between batches to avoid rate limits
         if i < num_batches - 1:
-            time.sleep(10)
+            time.sleep(15)
 
     return all_trends
 
@@ -207,25 +207,21 @@ def consolidate_trends(trends_list):
              consolidated_text += f"Trend: {trend.get('trend_name', 'N/A')}\n"
              articles = trend.get('relevant_articles', [])
              if isinstance(articles, list):
-                  consolidated_text += f"Relevant Articles: {', '.join(articles)}\n\n"
+                  consolidated_text += f"Articles: {', '.join(articles[:3])}\n\n"  # Limit to 3 articles per trend
 
-    system_prompt = "You are a helpful AI assistant that synthesizes information into a final report about India-US relations. You must respond ONLY with a valid JSON object containing a single key 'report' which is an array of objects."
+    system_prompt = "You synthesize India-US relations trends. Respond ONLY with valid JSON containing 'report' array."
     user_prompt = f"""
-    From the following list of topics, please synthesize the top 7-10 overall trending topics specifically about the relationship between India and the USA.
-    Merge similar or duplicate topics. For each final trend, provide:
-    1. A concise "trend_name" for the Indo-American topic.
-    2. A one-sentence "explanation" of the trend.
-    3. An array of "relevant_articles" containing all relevant article titles you can find.
-
-    List of topics to analyze:
+    Synthesize top 5-7 India-US trends from this data. Merge similar topics.
+    
+    Data:
     ---
-    {consolidated_text}
+    {consolidated_text[:2000]}  
     ---
     
-    Example JSON format:
+    JSON format:
     {{
         "report": [
-            {{ "trend_name": "Modi-Biden Diplomatic Talks", "explanation": "Leaders from both nations are meeting to discuss strategic partnerships.", "relevant_articles": ["Title A", "Title B", "Title C"] }}
+            {{ "trend_name": "Modi-Biden Summit", "explanation": "Recent diplomatic meeting between leaders.", "relevant_articles": ["Title 1", "Title 2"] }}
         ]
     }}
     """
@@ -287,15 +283,15 @@ def get_articles():
         }), 500
 
 @app.route('/trends', methods=['GET'])
-@rate_limit(max_requests=3, per_minutes=30)
+@rate_limit(max_requests=2, per_minutes=60)
 def get_trends():
     """Get trending India-US news topics"""
     try:
         hours_back = request.args.get('hours', 72, type=int)
         hours_back = min(max(hours_back, 1), 168)  # Limit between 1 and 168 hours
         
-        batch_size = request.args.get('batch_size', 25, type=int)
-        batch_size = min(max(batch_size, 10), 50)  # Limit batch size
+        batch_size = request.args.get('batch_size', 15, type=int)
+        batch_size = min(max(batch_size, 10), 20)  # Smaller batch size
         
         # Get articles
         articles = get_articles_from_feeds(RSS_FEEDS, hours_back=hours_back)
@@ -308,6 +304,11 @@ def get_trends():
                 "articles_analyzed": 0,
                 "timestamp": datetime.now().isoformat()
             })
+        
+        # Limit articles to avoid timeout
+        if len(articles) > 50:
+            articles = articles[:50]
+            logger.info(f"Limited to first 50 articles to avoid timeout")
         
         # Analyze trends
         preliminary_trends = analyze_articles_in_batches(articles, batch_size=batch_size)
