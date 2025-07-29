@@ -1,7 +1,7 @@
+
 Flask==2.3.3
 Flask-CORS==4.0.0
 feedparser==6.0.11
 requests==2.31.0
-groq==0.9.0
 gunicorn==21.2.0
 python-dateutil==2.8.2

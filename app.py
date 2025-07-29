@@ -18,6 +18,7 @@ CORS(app)  # Enable CORS for all routes
 
 # --- Configuration ---
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', "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")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # RSS Feeds focused on India-US News
 RSS_FEEDS = [
@@ -34,7 +35,6 @@ def rate_limit(max_requests=10, per_minutes=60):
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            # Simple in-memory rate limiting (use Redis in production)
             client_ip = request.remote_addr
             current_time = time.time()
             
@@ -102,55 +102,71 @@ def get_articles_from_feeds(feed_urls, hours_back=72):
     logger.info(f"Found {len(all_articles)} new articles from the last {hours_back} hours.")
     return all_articles
 
-def call_groq_api(system_prompt, user_prompt, max_retries=3):
+def call_groq_api_http(system_prompt, user_prompt, max_retries=3):
     """
-    A centralized function to call the Groq API with retry logic.
+    Call Groq API using direct HTTP requests instead of the problematic client library.
     """
     if not GROQ_API_KEY or GROQ_API_KEY == "PASTE_YOUR_GROQ_API_KEY_HERE":
         logger.error("Groq API key not set.")
         return None
 
-    try:
-        # Import groq here to handle version issues
-        import groq
-        client = groq.Groq(api_key=GROQ_API_KEY)
-    except Exception as e:
-        logger.error(f"Error initializing Groq client: {e}")
-        return None
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "model": "llama3-8b-8192",
+        "response_format": {"type": "json_object"},
+        "max_tokens": 4096,
+        "temperature": 0.3
+    }
 
     for attempt in range(max_retries):
         try:
-            chat_completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                model="llama3-8b-8192",
-                response_format={"type": "json_object"},
-                max_tokens=4096,
-                temperature=0.3
+            response = requests.post(
+                GROQ_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=60
             )
             
-            response_text = chat_completion.choices[0].message.content
-            return json.loads(response_text)
-
-        except Exception as e:
-            if "rate" in str(e).lower():
+            if response.status_code == 200:
+                response_json = response.json()
+                content = response_json['choices'][0]['message']['content']
+                return json.loads(content)
+            elif response.status_code == 429:
                 wait_time = 30 * (attempt + 1)
                 logger.warning(f"Rate limit hit. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait_time)
-            elif "api" in str(e).lower():
-                wait_time = 15 * (attempt + 1)
-                logger.error(f"Groq API Error: {e}. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
             else:
-                logger.error(f"Unexpected error: {e}")
-                return None
+                logger.error(f"Groq API returned status {response.status_code}: {response.text}")
+                wait_time = 15 * (attempt + 1)
+                time.sleep(wait_time)
+
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timeout on attempt {attempt + 1}")
+            if attempt < max_retries - 1:
+                time.sleep(20)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(15)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return None
 
     logger.error("All retries failed.")
     return None
 
-def analyze_articles_in_batches(articles, batch_size=15):
+def analyze_articles_in_batches(articles, batch_size=10):
     """
     Analyzes articles in smaller batches to avoid hitting API rate limits.
     """
@@ -163,7 +179,9 @@ def analyze_articles_in_batches(articles, batch_size=15):
 
         content_for_analysis = ""
         for article in batch:
-            content_for_analysis += f"Title: {article['title']}\nSummary: {article['summary'][:200]}...\n\n"
+            # Truncate summary to avoid token limits
+            summary = article['summary'][:150] if article['summary'] else "No summary"
+            content_for_analysis += f"Title: {article['title']}\nSummary: {summary}\n\n"
 
         system_prompt = "You are an expert geopolitical analyst focused on India-US relations. Identify news topics involving BOTH India and USA. Respond ONLY with valid JSON containing 'trends' array."
         user_prompt = f"""
@@ -171,24 +189,25 @@ def analyze_articles_in_batches(articles, batch_size=15):
         
         Content:
         ---
-        {content_for_analysis}
+        {content_for_analysis[:1500]}
         ---
         
         JSON format:
         {{
             "trends": [
-                {{ "trend_name": "US-India Trade Deal", "relevant_articles": ["Article Title 1", "Article Title 2"] }}
+                {{ "trend_name": "US-India Trade Deal", "relevant_articles": ["Article Title 1"] }}
             ]
         }}
         """
         
-        response_json = call_groq_api(system_prompt, user_prompt)
+        response_json = call_groq_api_http(system_prompt, user_prompt)
         if response_json and 'trends' in response_json and isinstance(response_json['trends'], list):
             all_trends.extend(response_json['trends'])
         
         # Wait between batches to avoid rate limits
         if i < num_batches - 1:
-            time.sleep(15)
+            logger.info("Waiting 20 seconds before next batch...")
+            time.sleep(20)
 
     return all_trends
 
@@ -206,27 +225,27 @@ def consolidate_trends(trends_list):
         if isinstance(trend, dict):
              consolidated_text += f"Trend: {trend.get('trend_name', 'N/A')}\n"
              articles = trend.get('relevant_articles', [])
-             if isinstance(articles, list):
-                  consolidated_text += f"Articles: {', '.join(articles[:3])}\n\n"  # Limit to 3 articles per trend
+             if isinstance(articles, list) and articles:
+                  consolidated_text += f"Articles: {articles[0]}\n\n"  # Just first article to save tokens
 
     system_prompt = "You synthesize India-US relations trends. Respond ONLY with valid JSON containing 'report' array."
     user_prompt = f"""
-    Synthesize top 5-7 India-US trends from this data. Merge similar topics.
+    Synthesize top 5 India-US trends from this data. Merge similar topics.
     
     Data:
     ---
-    {consolidated_text[:2000]}  
+    {consolidated_text[:1000]}  
     ---
     
     JSON format:
     {{
         "report": [
-            {{ "trend_name": "Modi-Biden Summit", "explanation": "Recent diplomatic meeting between leaders.", "relevant_articles": ["Title 1", "Title 2"] }}
+            {{ "trend_name": "Modi-Biden Summit", "explanation": "Recent diplomatic meeting.", "relevant_articles": ["Title 1"] }}
         ]
     }}
     """
     
-    response_json = call_groq_api(system_prompt, user_prompt)
+    response_json = call_groq_api_http(system_prompt, user_prompt)
     if response_json and 'report' in response_json:
         return response_json['report']
     return None
@@ -290,8 +309,8 @@ def get_trends():
         hours_back = request.args.get('hours', 72, type=int)
         hours_back = min(max(hours_back, 1), 168)  # Limit between 1 and 168 hours
         
-        batch_size = request.args.get('batch_size', 15, type=int)
-        batch_size = min(max(batch_size, 10), 20)  # Smaller batch size
+        batch_size = request.args.get('batch_size', 10, type=int)
+        batch_size = min(max(batch_size, 5), 15)  # Even smaller batch size
         
         # Get articles
         articles = get_articles_from_feeds(RSS_FEEDS, hours_back=hours_back)
@@ -305,10 +324,10 @@ def get_trends():
                 "timestamp": datetime.now().isoformat()
             })
         
-        # Limit articles to avoid timeout
-        if len(articles) > 50:
-            articles = articles[:50]
-            logger.info(f"Limited to first 50 articles to avoid timeout")
+        # Limit articles to avoid timeout (even more conservative)
+        if len(articles) > 30:
+            articles = articles[:30]
+            logger.info(f"Limited to first 30 articles to avoid timeout")
         
         # Analyze trends
         preliminary_trends = analyze_articles_in_batches(articles, batch_size=batch_size)
@@ -387,5 +406,4 @@ if __name__ == '__main__':
     logger.info(f"Groq API configured: {bool(GROQ_API_KEY and GROQ_API_KEY != 'PASTE_YOUR_GROQ_API_KEY_HERE')}")
     
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
-
 
