@@ -1,4 +1,5 @@
-
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 import feedparser
 import requests
 import json
@@ -6,40 +7,77 @@ import os
 from datetime import datetime, timedelta
 import time
 import groq
-from flask import Flask, jsonify
+import logging
+from functools import wraps
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # --- Configuration ---
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', "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")
 
-# Initialize Flask App
-app = Flask(__name__)
-
-# It's best practice to get the API key from an environment variable
-# On your deployment server, you will set this environment variable.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
-
-# Calibrated RSS Feeds for India-US News
+# RSS Feeds focused on India-US News
 RSS_FEEDS = [
     "https://www.thehindu.com/news/international/feeder/default.rss",
     "https://zeenews.india.com/rss/india-national-news.xml",
-    "https://timesofindia.indiatimes.com/rssfeeds/7098551.cms", # US News from Times of India
+    "https://timesofindia.indiatimes.com/rssfeeds/7098551.cms",
     "https://feeds.bbci.co.uk/news/world/asia/rss.xml",
     "https://www.reuters.com/news/archive/worldNews",
-    "https://www.cfr.org/rss/region/south-asia", # Council on Foreign Relations - South Asia
+    "https://www.cfr.org/rss/region/south-asia",
 ]
 
-# --- Core Logic Functions (from the original script) ---
+# Rate limiting decorator
+def rate_limit(max_requests=10, per_minutes=60):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            # Simple in-memory rate limiting (use Redis in production)
+            client_ip = request.remote_addr
+            current_time = time.time()
+            
+            if not hasattr(decorated_function, 'requests'):
+                decorated_function.requests = {}
+            
+            if client_ip not in decorated_function.requests:
+                decorated_function.requests[client_ip] = []
+            
+            # Clean old requests
+            decorated_function.requests[client_ip] = [
+                req_time for req_time in decorated_function.requests[client_ip]
+                if current_time - req_time < per_minutes * 60
+            ]
+            
+            if len(decorated_function.requests[client_ip]) >= max_requests:
+                return jsonify({
+                    "error": "Rate limit exceeded",
+                    "message": f"Maximum {max_requests} requests per {per_minutes} minutes"
+                }), 429
+            
+            decorated_function.requests[client_ip].append(current_time)
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
-def get_articles_from_feeds(feed_urls):
+# --- Core Functions ---
+def get_articles_from_feeds(feed_urls, hours_back=72):
     """
     Fetches and parses articles from a list of RSS feed URLs.
     """
     all_articles = []
-    lookback_period = datetime.now() - timedelta(hours=72)
-    print("Fetching articles from feeds (looking back 72 hours)...")
+    lookback_period = datetime.now() - timedelta(hours=hours_back)
+
+    logger.info(f"Fetching articles from feeds (looking back {hours_back} hours)...")
+    
     for url in feed_urls:
         try:
             feed = feedparser.parse(url, agent="AITrendFinder/1.0")
-            print(f"-> Checking feed: {feed.feed.get('title', url)}")
+            feed_title = feed.feed.get('title', url)
+            logger.info(f"Checking feed: {feed_title}")
+            
             for entry in feed.entries:
                 published_time = None
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
@@ -49,123 +87,304 @@ def get_articles_from_feeds(feed_urls):
 
                 if not published_time or published_time < lookback_period:
                     continue
-                article = {'title': entry.title, 'link': entry.link, 'summary': entry.get('summary', 'No summary available.')}
+
+                article = {
+                    'title': entry.title,
+                    'link': entry.link,
+                    'summary': entry.get('summary', entry.get('description', 'No summary available.')),
+                    'published': published_time.isoformat() if published_time else None,
+                    'source': feed_title
+                }
                 all_articles.append(article)
+                
         except Exception as e:
-            print(f"Error fetching or parsing feed {url}: {e}")
-    print(f"\nFound {len(all_articles)} new articles from the last 72 hours.")
+            logger.error(f"Error fetching or parsing feed {url}: {e}")
+    
+    logger.info(f"Found {len(all_articles)} new articles from the last {hours_back} hours.")
     return all_articles
 
 def call_groq_api(system_prompt, user_prompt, max_retries=3):
     """
     A centralized function to call the Groq API with retry logic.
     """
-    if not GROQ_API_KEY:
-        print("Groq API key not set.")
+    if not GROQ_API_KEY or GROQ_API_KEY == "PASTE_YOUR_GROQ_API_KEY_HERE":
+        logger.error("Groq API key not set.")
         return None
+
     try:
         client = groq.Groq(api_key=GROQ_API_KEY)
     except Exception as e:
-        print(f"Error initializing Groq client: {e}")
+        logger.error(f"Error initializing Groq client: {e}")
         return None
+
     for attempt in range(max_retries):
         try:
             chat_completion = client.chat.completions.create(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
                 model="llama3-8b-8192",
                 response_format={"type": "json_object"},
                 max_tokens=8192,
             )
+            
             response_text = chat_completion.choices[0].message.content
             return json.loads(response_text)
+
+        except groq.RateLimitError as e:
+            wait_time = 20 * (attempt + 1)
+            logger.warning(f"Rate limit hit. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait_time)
+        except groq.APIError as e:
+            wait_time = 10 * (attempt + 1)
+            logger.error(f"Groq API Error: {e}. Retrying in {wait_time} seconds... (Attempt {attempt + 1}/{max_retries})")
+            time.sleep(wait_time)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON from Groq response: {e}")
+            return None
         except Exception as e:
-            print(f"API call attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-            else:
-                return None
+            logger.error(f"An unexpected error occurred: {e}")
+            return None
+
+    logger.error("All retries failed.")
     return None
 
 def analyze_articles_in_batches(articles, batch_size=25):
     """
-    Analyzes articles in smaller batches.
+    Analyzes articles in smaller batches to avoid hitting API rate limits.
     """
     all_trends = []
     num_batches = (len(articles) + batch_size - 1) // batch_size
+
     for i in range(num_batches):
-        print(f"\n--- Processing Batch {i+1} of {num_batches} with Groq ---")
+        logger.info(f"Processing Batch {i+1} of {num_batches} with Groq")
         batch = articles[i * batch_size:(i + 1) * batch_size]
-        content_for_analysis = "".join([f"Title: {a['title']}\nSummary: {a['summary']}\n\n" for a in batch])
-        system_prompt = "You are an expert geopolitical analyst on India-US relations. Identify topics involving an interaction between India and the United States. Respond ONLY with a valid JSON object with a 'trends' key."
-        user_prompt = f"From the articles below, identify topics involving BOTH India and the USA. For each, provide a name and relevant article titles.\n\nContent:\n{content_for_analysis}"
+
+        content_for_analysis = ""
+        for article in batch:
+            content_for_analysis += f"Title: {article['title']}\nSummary: {article['summary']}\n\n"
+
+        system_prompt = "You are an expert geopolitical analyst focused on India-US relations. Your task is to identify news topics that specifically involve an interaction between India and the United States. You must respond ONLY with a valid JSON object containing a single key 'trends' which is an array of objects."
+        user_prompt = f"""
+        From the following batch of articles, please identify key topics or ideas that involve BOTH India and the USA. Ignore topics that are only about India or only about the USA.
+        For each topic, provide a concise name and the titles of all relevant articles in this batch.
+        
+        Content:
+        ---
+        {content_for_analysis}
+        ---
+        
+        Example JSON format:
+        {{
+            "trends": [
+                {{ "trend_name": "US-India Trade Negotiations", "relevant_articles": ["Title A", "Title B"] }}
+            ]
+        }}
+        """
+        
         response_json = call_groq_api(system_prompt, user_prompt)
-        if response_json and 'trends' in response_json:
+        if response_json and 'trends' in response_json and isinstance(response_json['trends'], list):
             all_trends.extend(response_json['trends'])
+        
         if i < num_batches - 1:
             time.sleep(10)
+
     return all_trends
 
 def consolidate_trends(trends_list):
     """
-    Performs a final analysis to find the top overall trends.
+    Takes a list of trends from all batches and performs a final analysis.
     """
     if not trends_list:
         return None
-    print("\n--- Consolidating all trends for final report with Groq ---")
-    consolidated_text = "".join([f"Trend: {t.get('trend_name', 'N/A')}\nRelevant Articles: {', '.join(t.get('relevant_articles', []))}\n\n" for t in trends_list if isinstance(t, dict)])
-    system_prompt = "You are an AI assistant synthesizing a report on India-US relations. Respond ONLY with a valid JSON object with a 'report' key."
-    user_prompt = f"From the topics below, synthesize the top 7-10 trending topics about the India-USA relationship. Merge duplicates. For each, provide a 'trend_name', 'explanation', and 'relevant_articles'.\n\nTopics:\n{consolidated_text}"
+
+    logger.info("Consolidating all trends for final report with Groq")
+    
+    consolidated_text = ""
+    for trend in trends_list:
+        if isinstance(trend, dict):
+             consolidated_text += f"Trend: {trend.get('trend_name', 'N/A')}\n"
+             articles = trend.get('relevant_articles', [])
+             if isinstance(articles, list):
+                  consolidated_text += f"Relevant Articles: {', '.join(articles)}\n\n"
+
+    system_prompt = "You are a helpful AI assistant that synthesizes information into a final report about India-US relations. You must respond ONLY with a valid JSON object containing a single key 'report' which is an array of objects."
+    user_prompt = f"""
+    From the following list of topics, please synthesize the top 7-10 overall trending topics specifically about the relationship between India and the USA.
+    Merge similar or duplicate topics. For each final trend, provide:
+    1. A concise "trend_name" for the Indo-American topic.
+    2. A one-sentence "explanation" of the trend.
+    3. An array of "relevant_articles" containing all relevant article titles you can find.
+
+    List of topics to analyze:
+    ---
+    {consolidated_text}
+    ---
+    
+    Example JSON format:
+    {{
+        "report": [
+            {{ "trend_name": "Modi-Biden Diplomatic Talks", "explanation": "Leaders from both nations are meeting to discuss strategic partnerships.", "relevant_articles": ["Title A", "Title B", "Title C"] }}
+        ]
+    }}
+    """
+    
     response_json = call_groq_api(system_prompt, user_prompt)
     if response_json and 'report' in response_json:
         return response_json['report']
     return None
 
-# --- API Endpoints ---
+# --- API Routes ---
 
 @app.route('/', methods=['GET'])
 def home():
-    """A simple endpoint to check if the API is running."""
-    return "<h1>Indo-American News API</h1><p>API is running. Use the /get-trends endpoint to fetch data.</p>"
+    """Health check endpoint"""
+    return jsonify({
+        "message": "India-US News Trends API",
+        "version": "1.0",
+        "status": "active",
+        "endpoints": {
+            "/trends": "GET - Get trending India-US news topics",
+            "/articles": "GET - Get recent articles from feeds",
+            "/health": "GET - Health check"
+        }
+    })
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "groq_api_configured": bool(GROQ_API_KEY and GROQ_API_KEY != "PASTE_YOUR_GROQ_API_KEY_HERE")
+    })
 
-@app.route('/get-trends', methods=['GET'])
-def get_trends_api():
-    """
-    This is the main API endpoint. It runs the analysis and returns the trends.
-    """
-    print("API endpoint /get-trends hit. Starting analysis...")
+@app.route('/articles', methods=['GET'])
+@rate_limit(max_requests=5, per_minutes=10)
+def get_articles():
+    """Get recent articles from RSS feeds"""
     try:
-        articles = get_articles_from_feeds(RSS_FEEDS)
-        if not articles:
-            return jsonify({"error": "No articles found in the last 72 hours."}), 404
+        hours_back = request.args.get('hours', 72, type=int)
+        hours_back = min(max(hours_back, 1), 168)  # Limit between 1 and 168 hours (1 week)
         
-        preliminary_trends = analyze_articles_in_batches(articles)
-        if not preliminary_trends:
-            return jsonify({"error": "Could not determine preliminary trends from articles."}), 500
-
-        final_trends = consolidate_trends(preliminary_trends)
-        if not final_trends:
-            return jsonify({"error": "Could not consolidate trends into a final report."}), 500
-
-        # Add the article links back into the final report
-        article_dict = {article['title']: article['link'] for article in articles}
-        for trend in final_trends:
-            trend['articles_with_links'] = []
-            for title in trend.get('relevant_articles', []):
-                trend['articles_with_links'].append({
-                    "title": title,
-                    "link": article_dict.get(title, "#")
-                })
-
-        return jsonify(final_trends)
-
+        articles = get_articles_from_feeds(RSS_FEEDS, hours_back=hours_back)
+        
+        return jsonify({
+            "success": True,
+            "count": len(articles),
+            "hours_back": hours_back,
+            "articles": articles,
+            "timestamp": datetime.now().isoformat()
+        })
+    
     except Exception as e:
-        print(f"An unexpected error occurred in the API endpoint: {e}")
-        return jsonify({"error": "An internal server error occurred."}), 500
+        logger.error(f"Error in get_articles: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
 
-# --- Main Execution Block ---
-# --- CHANGE: Added host and port for better deployment compatibility ---
+@app.route('/trends', methods=['GET'])
+@rate_limit(max_requests=3, per_minutes=30)
+def get_trends():
+    """Get trending India-US news topics"""
+    try:
+        hours_back = request.args.get('hours', 72, type=int)
+        hours_back = min(max(hours_back, 1), 168)  # Limit between 1 and 168 hours
+        
+        batch_size = request.args.get('batch_size', 25, type=int)
+        batch_size = min(max(batch_size, 10), 50)  # Limit batch size
+        
+        # Get articles
+        articles = get_articles_from_feeds(RSS_FEEDS, hours_back=hours_back)
+        
+        if not articles:
+            return jsonify({
+                "success": True,
+                "message": "No recent articles found",
+                "trends": [],
+                "articles_analyzed": 0,
+                "timestamp": datetime.now().isoformat()
+            })
+        
+        # Analyze trends
+        preliminary_trends = analyze_articles_in_batches(articles, batch_size=batch_size)
+        final_trends = consolidate_trends(preliminary_trends)
+        
+        # Create article lookup dictionary
+        article_dict = {article['title']: article for article in articles}
+        
+        # Enhance trends with full article information
+        enhanced_trends = []
+        if final_trends:
+            for trend in final_trends:
+                if isinstance(trend, dict):
+                    enhanced_trend = {
+                        "trend_name": trend.get('trend_name', 'N/A'),
+                        "explanation": trend.get('explanation', 'No explanation provided.'),
+                        "relevant_articles": []
+                    }
+                    
+                    relevant_articles = trend.get('relevant_articles', [])
+                    if isinstance(relevant_articles, list):
+                        for title in relevant_articles:
+                            if title in article_dict:
+                                enhanced_trend["relevant_articles"].append(article_dict[title])
+                            else:
+                                # If exact match not found, add as title only
+                                enhanced_trend["relevant_articles"].append({
+                                    "title": title,
+                                    "link": "# (Link not found)",
+                                    "summary": "Article details not available",
+                                    "published": None,
+                                    "source": "Unknown"
+                                })
+                    
+                    enhanced_trends.append(enhanced_trend)
+        
+        return jsonify({
+            "success": True,
+            "trends_count": len(enhanced_trends),
+            "articles_analyzed": len(articles),
+            "hours_back": hours_back,
+            "trends": enhanced_trends,
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    except Exception as e:
+        logger.error(f"Error in get_trends: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        "success": False,
+        "error": "Endpoint not found",
+        "available_endpoints": ["/", "/health", "/articles", "/trends"]
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Internal server error",
+        "message": "Please try again later"
+    }), 500
+
 if __name__ == '__main__':
-    # For production, a proper WSGI server like Gunicorn should be used.
-    # The host='0.0.0.0' makes it accessible from outside the container.
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    
+    logger.info(f"Starting Flask app on port {port}")
+    logger.info(f"Debug mode: {debug_mode}")
+    logger.info(f"Groq API configured: {bool(GROQ_API_KEY and GROQ_API_KEY != 'PASTE_YOUR_GROQ_API_KEY_HERE')}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
+
+
