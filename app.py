@@ -1,5 +1,4 @@
 
-
 import feedparser
 import requests
 import json
@@ -121,7 +120,13 @@ def consolidate_trends(trends_list):
         return response_json['report']
     return None
 
-# --- API Endpoint ---
+# --- API Endpoints ---
+
+@app.route('/', methods=['GET'])
+def home():
+    """A simple endpoint to check if the API is running."""
+    return "<h1>Indo-American News API</h1><p>API is running. Use the /get-trends endpoint to fetch data.</p>"
+
 
 @app.route('/get-trends', methods=['GET'])
 def get_trends_api():
@@ -159,8 +164,8 @@ def get_trends_api():
         return jsonify({"error": "An internal server error occurred."}), 500
 
 # --- Main Execution Block ---
-
+# --- CHANGE: Added host and port for better deployment compatibility ---
 if __name__ == '__main__':
-    # This runs the app in development mode.
     # For production, a proper WSGI server like Gunicorn should be used.
-    app.run(debug=True, port=5001)
+    # The host='0.0.0.0' makes it accessible from outside the container.
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
